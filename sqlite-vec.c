@@ -177,6 +177,53 @@ static f32 cosine_float_avx(const void *pVect1v, const void *pVect2v,
 }
 #endif
 
+#ifdef SQLITE_VEC_ENABLE_AVX512
+#include <immintrin.h>
+
+// 32-wide, unrolled-by-2 AVX-512 version of cosine_float_avx: one __m512 register
+// holds 16 floats natively, so two iterations of the AVX2 kernel's 16-wide inner
+// step collapse into one 32-wide step here. Same three running sums (dot product,
+// both vectors' squared magnitudes); _mm512_reduce_add_ps replaces the manual
+// store-and-sum horizontal reduction AVX2 needs, since AVX-512 has it built in.
+static f32 cosine_float_avx512(const void *pVect1v, const void *pVect2v,
+                               const void *qty_ptr) {
+  f32 *pVect1 = (f32 *)pVect1v;
+  f32 *pVect2 = (f32 *)pVect2v;
+  size_t qty = *((size_t *)qty_ptr);
+  size_t qty32 = qty >> 5;
+
+  const f32 *pEnd1 = pVect1 + (qty32 << 5);
+
+  __m512 v1, v2;
+  __m512 dot = _mm512_setzero_ps();
+  __m512 aMag = _mm512_setzero_ps();
+  __m512 bMag = _mm512_setzero_ps();
+
+  while (pVect1 < pEnd1) {
+    v1 = _mm512_loadu_ps(pVect1);
+    pVect1 += 16;
+    v2 = _mm512_loadu_ps(pVect2);
+    pVect2 += 16;
+    dot = _mm512_fmadd_ps(v1, v2, dot);
+    aMag = _mm512_fmadd_ps(v1, v1, aMag);
+    bMag = _mm512_fmadd_ps(v2, v2, bMag);
+
+    v1 = _mm512_loadu_ps(pVect1);
+    pVect1 += 16;
+    v2 = _mm512_loadu_ps(pVect2);
+    pVect2 += 16;
+    dot = _mm512_fmadd_ps(v1, v2, dot);
+    aMag = _mm512_fmadd_ps(v1, v1, aMag);
+    bMag = _mm512_fmadd_ps(v2, v2, bMag);
+  }
+
+  f32 dotSum = _mm512_reduce_add_ps(dot);
+  f32 aMagSum = _mm512_reduce_add_ps(aMag);
+  f32 bMagSum = _mm512_reduce_add_ps(bMag);
+  return 1 - (dotSum / (sqrt(aMagSum) * sqrt(bMagSum)));
+}
+#endif
+
 #ifdef SQLITE_VEC_ENABLE_NEON
 #include <arm_neon.h>
 
@@ -559,6 +606,11 @@ static f32 distance_cosine_float(const void *a, const void *b, const void *d) {
 #ifdef SQLITE_VEC_ENABLE_NEON
   if ((*(const size_t *)d) > 16) {
     return cosine_float_neon(a, b, d);
+  }
+#endif
+#ifdef SQLITE_VEC_ENABLE_AVX512
+  if (((*(const size_t *)d) % 32 == 0)) {
+    return cosine_float_avx512(a, b, d);
   }
 #endif
 #ifdef SQLITE_VEC_ENABLE_AVX
