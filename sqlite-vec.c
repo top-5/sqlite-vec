@@ -163,6 +163,57 @@ static f32 l2_sqr_float_avx(const void *pVect1v, const void *pVect2v,
   return sqrt(TmpRes[0] + TmpRes[1] + TmpRes[2] + TmpRes[3] + TmpRes[4] +
               TmpRes[5] + TmpRes[6] + TmpRes[7]);
 }
+
+// Same 16-wide, unrolled-by-2 structure as l2_sqr_float_avx, but accumulating the
+// three running sums cosine distance needs (dot product, and both vectors' squared
+// magnitudes) instead of one. Horizontal-summed and combined the same way
+// cosine_float (the scalar fallback) computes 1 - (dot / (sqrt(aMag) * sqrt(bMag))).
+static f32 cosine_float_avx(const void *pVect1v, const void *pVect2v,
+                            const void *qty_ptr) {
+  f32 *pVect1 = (f32 *)pVect1v;
+  f32 *pVect2 = (f32 *)pVect2v;
+  size_t qty = *((size_t *)qty_ptr);
+  f32 PORTABLE_ALIGN32 TmpDot[8];
+  f32 PORTABLE_ALIGN32 TmpAMag[8];
+  f32 PORTABLE_ALIGN32 TmpBMag[8];
+  size_t qty16 = qty >> 4;
+
+  const f32 *pEnd1 = pVect1 + (qty16 << 4);
+
+  __m256 v1, v2;
+  __m256 dot = _mm256_set1_ps(0);
+  __m256 aMag = _mm256_set1_ps(0);
+  __m256 bMag = _mm256_set1_ps(0);
+
+  while (pVect1 < pEnd1) {
+    v1 = _mm256_loadu_ps(pVect1);
+    pVect1 += 8;
+    v2 = _mm256_loadu_ps(pVect2);
+    pVect2 += 8;
+    dot = _mm256_add_ps(dot, _mm256_mul_ps(v1, v2));
+    aMag = _mm256_add_ps(aMag, _mm256_mul_ps(v1, v1));
+    bMag = _mm256_add_ps(bMag, _mm256_mul_ps(v2, v2));
+
+    v1 = _mm256_loadu_ps(pVect1);
+    pVect1 += 8;
+    v2 = _mm256_loadu_ps(pVect2);
+    pVect2 += 8;
+    dot = _mm256_add_ps(dot, _mm256_mul_ps(v1, v2));
+    aMag = _mm256_add_ps(aMag, _mm256_mul_ps(v1, v1));
+    bMag = _mm256_add_ps(bMag, _mm256_mul_ps(v2, v2));
+  }
+
+  _mm256_store_ps(TmpDot, dot);
+  _mm256_store_ps(TmpAMag, aMag);
+  _mm256_store_ps(TmpBMag, bMag);
+  f32 dotSum = TmpDot[0] + TmpDot[1] + TmpDot[2] + TmpDot[3] + TmpDot[4] +
+              TmpDot[5] + TmpDot[6] + TmpDot[7];
+  f32 aMagSum = TmpAMag[0] + TmpAMag[1] + TmpAMag[2] + TmpAMag[3] + TmpAMag[4] +
+               TmpAMag[5] + TmpAMag[6] + TmpAMag[7];
+  f32 bMagSum = TmpBMag[0] + TmpBMag[1] + TmpBMag[2] + TmpBMag[3] + TmpBMag[4] +
+               TmpBMag[5] + TmpBMag[6] + TmpBMag[7];
+  return 1 - (dotSum / (sqrt(aMagSum) * sqrt(bMagSum)));
+}
 #endif
 
 #ifdef SQLITE_VEC_ENABLE_NEON
@@ -465,8 +516,8 @@ static double distance_l1_f32(const void *a, const void *b, const void *d) {
   return l1_f32(a, b, d);
 }
 
-static f32 distance_cosine_float(const void *pVect1v, const void *pVect2v,
-                                 const void *qty_ptr) {
+static f32 cosine_float(const void *pVect1v, const void *pVect2v,
+                        const void *qty_ptr) {
   f32 *pVect1 = (f32 *)pVect1v;
   f32 *pVect2 = (f32 *)pVect2v;
   size_t qty = *((size_t *)qty_ptr);
@@ -482,6 +533,14 @@ static f32 distance_cosine_float(const void *pVect1v, const void *pVect2v,
     pVect2++;
   }
   return 1 - (dot / (sqrt(aMag) * sqrt(bMag)));
+}
+static f32 distance_cosine_float(const void *a, const void *b, const void *d) {
+#ifdef SQLITE_VEC_ENABLE_AVX
+  if (((*(const size_t *)d) % 16 == 0)) {
+    return cosine_float_avx(a, b, d);
+  }
+#endif
+  return cosine_float(a, b, d);
 }
 static f32 distance_cosine_int8(const void *pA, const void *pB,
                                 const void *pD) {
