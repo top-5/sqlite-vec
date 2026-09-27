@@ -2,6 +2,7 @@ import pytest
 import sqlite3
 from collections import OrderedDict
 import json
+from helpers import exec, vec0_shadow_table_contents
 
 
 def test_constructor_limit(db, snapshot):
@@ -262,6 +263,35 @@ def test_deletes(db, snapshot):
     assert exec(db, "DELETE FROM v where rowid = 3") == snapshot()
     assert exec(db, "select * from v") == snapshot()
     assert vec0_shadow_table_contents(db, "v") == snapshot()
+
+
+def test_delete_by_metadata_with_long_text(db):
+    """Regression for https://github.com/asg017/sqlite-vec/issues/274.
+
+    ClearMetadata left rc=SQLITE_DONE after the long-text DELETE, which
+    propagated as an error and silently aborted the DELETE scan.
+    """
+    db.execute(
+        "create virtual table v using vec0("
+        "  tag text, embedding float[4], chunk_size=8"
+        ")"
+    )
+    for i in range(6):
+        db.execute(
+            "insert into v(tag, embedding) values (?, zeroblob(16))",
+            [f"long_text_value_{i}"],
+        )
+    for i in range(4):
+        db.execute(
+            "insert into v(tag, embedding) values (?, zeroblob(16))",
+            [f"long_text_value_0"],
+        )
+    assert db.execute("select count(*) from v").fetchone()[0] == 10
+
+    # DELETE by metadata WHERE — the pattern from the issue
+    db.execute("delete from v where tag = 'long_text_value_0'")
+    assert db.execute("select count(*) from v where tag = 'long_text_value_0'").fetchone()[0] == 0
+    assert db.execute("select count(*) from v").fetchone()[0] == 5
 
 
 def test_knn(db, snapshot):
@@ -594,36 +624,3 @@ def authorizer_deny_on(operation, x1, x2=None):
     return _auth
 
 
-def exec(db, sql, parameters=[]):
-    try:
-        rows = db.execute(sql, parameters).fetchall()
-    except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
-        return {
-            "error": e.__class__.__name__,
-            "message": str(e),
-        }
-    a = []
-    for row in rows:
-        o = OrderedDict()
-        for k in row.keys():
-            o[k] = row[k]
-        a.append(o)
-    result = OrderedDict()
-    result["sql"] = sql
-    result["rows"] = a
-    return result
-
-
-def vec0_shadow_table_contents(db, v):
-    shadow_tables = [
-        row[0]
-        for row in db.execute(
-            "select name from sqlite_master where name like ? order by 1", [f"{v}_%"]
-        ).fetchall()
-    ]
-    o = {}
-    for shadow_table in shadow_tables:
-        if shadow_table.endswith("_info"):
-            continue
-        o[shadow_table] = exec(db, f"select * from {shadow_table}")
-    return o

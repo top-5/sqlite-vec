@@ -35,19 +35,19 @@ ifdef CONFIG_WINDOWS
 LOADABLE_EXTENSION=dll
 endif
 
-
-ifdef python
-PYTHON=$(python)
-else
-PYTHON=python3
-endif
-
 ifndef OMIT_SIMD
 	ifeq ($(shell uname -sm),Darwin x86_64)
-	CFLAGS += -mavx -DSQLITE_VEC_ENABLE_AVX
+	CFLAGS += -mavx -mavx2 -DSQLITE_VEC_ENABLE_AVX
 	endif
 	ifeq ($(shell uname -sm),Darwin arm64)
 	CFLAGS += -mcpu=apple-m1 -DSQLITE_VEC_ENABLE_NEON
+	endif
+	ifeq ($(shell uname -s),Linux)
+	ifeq ($(findstring android,$(CC)),)
+	ifneq ($(filter avx,$(shell grep -o 'avx[^ ]*' /proc/cpuinfo 2>/dev/null | head -1)),)
+	CFLAGS += -mavx -mavx2 -DSQLITE_VEC_ENABLE_AVX
+	endif
+	endif
 	endif
 endif
 
@@ -162,6 +162,13 @@ clean:
 	rm -rf dist
 
 
+TARGET_AMALGAMATION=$(prefix)/sqlite-vec.c
+
+amalgamation: $(TARGET_AMALGAMATION)
+
+$(TARGET_AMALGAMATION): sqlite-vec.c $(wildcard sqlite-vec-*.c) scripts/amalgamate.py $(prefix)
+	python3 scripts/amalgamate.py sqlite-vec.c > $@
+
 FORMAT_FILES=sqlite-vec.h sqlite-vec.c
 format: $(FORMAT_FILES)
 	clang-format -i $(FORMAT_FILES)
@@ -181,23 +188,71 @@ evidence-of:
 test:
 	sqlite3 :memory: '.read test.sql'
 
-.PHONY: version loadable static test clean gh-release evidence-of install uninstall
+.PHONY: version loadable static test clean gh-release evidence-of install uninstall amalgamation
 
 publish-release:
 	./scripts/publish-release.sh
 
 # -k test_vec0_update
 test-loadable: loadable
-	$(PYTHON) -m pytest -vv -s -x tests/test-*.py
+	uv run --managed-python --project tests pytest -vv -s -x . tests/test-*.py
 
 test-loadable-snapshot-update: loadable
-	$(PYTHON) -m pytest -vv tests/test-loadable.py --snapshot-update
+	uv run --managed-python --project tests pytest -vv tests/test-loadable.py --snapshot-update
 
 test-loadable-watch:
 	watchexec --exts c,py,Makefile --clear -- make test-loadable
 
 test-unit:
-	$(CC) tests/test-unit.c sqlite-vec.c -I./ -Ivendor -o $(prefix)/test-unit && $(prefix)/test-unit
+	$(CC) -DSQLITE_CORE -DSQLITE_VEC_TEST -DSQLITE_VEC_ENABLE_RESCORE -DSQLITE_VEC_ENABLE_DISKANN=1 tests/test-unit.c sqlite-vec.c vendor/sqlite3.c -I./ -Ivendor $(CFLAGS) -o $(prefix)/test-unit && $(prefix)/test-unit
+
+# Standalone sqlite3 CLI with vec0 compiled in. Useful for benchmarking,
+# profiling (has debug symbols), and scripting without .load_extension.
+#   make cli
+#   dist/sqlite3 :memory: "SELECT vec_version()"
+#   dist/sqlite3 < script.sql
+cli: sqlite-vec.h $(prefix)
+	$(CC) -O2 -g \
+	-DSQLITE_CORE \
+	-DSQLITE_EXTRA_INIT=core_init \
+	-DSQLITE_THREADSAFE=0 \
+	-Ivendor/ -I./ \
+	$(CFLAGS) \
+	vendor/sqlite3.c vendor/shell.c sqlite-vec.c examples/sqlite3-cli/core_init.c \
+	-ldl -lm -o $(prefix)/sqlite3
+
+fuzz-build:
+	$(MAKE) -C tests/fuzz all
+
+fuzz-quick: fuzz-build
+	@echo "Running all fuzz targets for 30 seconds each..."
+	@for target in tests/fuzz/targets/*; do \
+	  [ -f "$$target" ] && [ -x "$$target" ] || continue; \
+	  name=$$(basename $$target); \
+	  echo "=== Fuzzing $$name ==="; \
+	  corpus="tests/fuzz/corpus/$$name"; \
+	  mkdir -p "$$corpus"; \
+	  dict="tests/fuzz/$${name//_/-}.dict"; \
+	  dict_flag=""; \
+	  [ -f "$$dict" ] && dict_flag="-dict=$$dict"; \
+	  "$$target" $$dict_flag \
+	    -max_total_time=30 "$$corpus" 2>&1 || true; \
+	done
+
+fuzz-long: fuzz-build
+	@echo "Running all fuzz targets for 5 minutes each..."
+	@for target in tests/fuzz/targets/*; do \
+	  [ -f "$$target" ] && [ -x "$$target" ] || continue; \
+	  name=$$(basename $$target); \
+	  echo "=== Fuzzing $$name ==="; \
+	  corpus="tests/fuzz/corpus/$$name"; \
+	  mkdir -p "$$corpus"; \
+	  dict="tests/fuzz/$${name//_/-}.dict"; \
+	  dict_flag=""; \
+	  [ -f "$$dict" ] && dict_flag="-dict=$$dict"; \
+	  "$$target" $$dict_flag \
+	    -max_total_time=300 "$$corpus" 2>&1 || true; \
+	done
 
 site-dev:
 	npm --prefix site run dev

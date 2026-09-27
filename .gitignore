@@ -32,6 +32,8 @@ poetry.lock
 memstat.c
 memstat.*
 
+.DS_Store
+
 # Local Windows/MSVC build outputs
 sqlite-vec.obj
 vec-windows.zip
