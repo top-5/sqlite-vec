@@ -125,10 +125,132 @@ static f32 l2_sqr_float_avx(const void *pVect1v, const void *pVect2v,
               TmpRes[5] + TmpRes[6] + TmpRes[7]);
 }
 
+#endif
+
+// Runtime-dispatched AVX2/AVX-512 cosine kernels (GCC/Clang, incl. clang-cl):
+// unlike l2_sqr_float_avx above -- compiled in only when SQLITE_VEC_ENABLE_AVX is
+// set, and only safe to run when the whole TU was built with matching -march/-mavx
+// flags -- these use the compiler's per-function `target` attribute, so they're
+// always compiled in and only ever invoked after a __builtin_cpu_supports() check
+// (see distance_cosine_float's dispatcher below) confirms the running CPU actually
+// has the ISA. One build is then safe to run on any x86-64 machine and always
+// picks the fastest kernel that machine supports, instead of needing a separate
+// binary -- or risking an illegal-instruction crash -- per target ISA.
+#if defined(__GNUC__) || defined(__clang__)
+#include <immintrin.h>
+#ifndef PORTABLE_ALIGN32
+#define PORTABLE_ALIGN32 __attribute__((aligned(32)))
+#endif
+
 // Same 16-wide, unrolled-by-2 structure as l2_sqr_float_avx, but accumulating the
 // three running sums cosine distance needs (dot product, and both vectors' squared
 // magnitudes) instead of one. Horizontal-summed and combined the same way
 // cosine_float (the scalar fallback) computes 1 - (dot / (sqrt(aMag) * sqrt(bMag))).
+__attribute__((target("avx2,fma")))
+static f32 cosine_float_avx(const void *pVect1v, const void *pVect2v,
+                            const void *qty_ptr) {
+  f32 *pVect1 = (f32 *)pVect1v;
+  f32 *pVect2 = (f32 *)pVect2v;
+  size_t qty = *((size_t *)qty_ptr);
+  f32 PORTABLE_ALIGN32 TmpDot[8];
+  f32 PORTABLE_ALIGN32 TmpAMag[8];
+  f32 PORTABLE_ALIGN32 TmpBMag[8];
+  size_t qty16 = qty >> 4;
+
+  const f32 *pEnd1 = pVect1 + (qty16 << 4);
+
+  __m256 v1, v2;
+  __m256 dot = _mm256_set1_ps(0);
+  __m256 aMag = _mm256_set1_ps(0);
+  __m256 bMag = _mm256_set1_ps(0);
+
+  while (pVect1 < pEnd1) {
+    v1 = _mm256_loadu_ps(pVect1);
+    pVect1 += 8;
+    v2 = _mm256_loadu_ps(pVect2);
+    pVect2 += 8;
+    dot = _mm256_add_ps(dot, _mm256_mul_ps(v1, v2));
+    aMag = _mm256_add_ps(aMag, _mm256_mul_ps(v1, v1));
+    bMag = _mm256_add_ps(bMag, _mm256_mul_ps(v2, v2));
+
+    v1 = _mm256_loadu_ps(pVect1);
+    pVect1 += 8;
+    v2 = _mm256_loadu_ps(pVect2);
+    pVect2 += 8;
+    dot = _mm256_add_ps(dot, _mm256_mul_ps(v1, v2));
+    aMag = _mm256_add_ps(aMag, _mm256_mul_ps(v1, v1));
+    bMag = _mm256_add_ps(bMag, _mm256_mul_ps(v2, v2));
+  }
+
+  _mm256_store_ps(TmpDot, dot);
+  _mm256_store_ps(TmpAMag, aMag);
+  _mm256_store_ps(TmpBMag, bMag);
+  f32 dotSum = TmpDot[0] + TmpDot[1] + TmpDot[2] + TmpDot[3] + TmpDot[4] +
+              TmpDot[5] + TmpDot[6] + TmpDot[7];
+  f32 aMagSum = TmpAMag[0] + TmpAMag[1] + TmpAMag[2] + TmpAMag[3] + TmpAMag[4] +
+               TmpAMag[5] + TmpAMag[6] + TmpAMag[7];
+  f32 bMagSum = TmpBMag[0] + TmpBMag[1] + TmpBMag[2] + TmpBMag[3] + TmpBMag[4] +
+               TmpBMag[5] + TmpBMag[6] + TmpBMag[7];
+  return 1 - (dotSum / (sqrt(aMagSum) * sqrt(bMagSum)));
+}
+
+// 32-wide, unrolled-by-2 AVX-512 version of cosine_float_avx: one __m512 register
+// holds 16 floats natively, so two iterations of the AVX2 kernel's 16-wide inner
+// step collapse into one 32-wide step here. Same three running sums (dot product,
+// both vectors' squared magnitudes); _mm512_reduce_add_ps replaces the manual
+// store-and-sum horizontal reduction AVX2 needs, since AVX-512 has it built in.
+__attribute__((target("avx512f,fma")))
+static f32 cosine_float_avx512(const void *pVect1v, const void *pVect2v,
+                               const void *qty_ptr) {
+  f32 *pVect1 = (f32 *)pVect1v;
+  f32 *pVect2 = (f32 *)pVect2v;
+  size_t qty = *((size_t *)qty_ptr);
+  size_t qty32 = qty >> 5;
+
+  const f32 *pEnd1 = pVect1 + (qty32 << 5);
+
+  __m512 v1, v2;
+  __m512 dot = _mm512_setzero_ps();
+  __m512 aMag = _mm512_setzero_ps();
+  __m512 bMag = _mm512_setzero_ps();
+
+  while (pVect1 < pEnd1) {
+    v1 = _mm512_loadu_ps(pVect1);
+    pVect1 += 16;
+    v2 = _mm512_loadu_ps(pVect2);
+    pVect2 += 16;
+    dot = _mm512_fmadd_ps(v1, v2, dot);
+    aMag = _mm512_fmadd_ps(v1, v1, aMag);
+    bMag = _mm512_fmadd_ps(v2, v2, bMag);
+
+    v1 = _mm512_loadu_ps(pVect1);
+    pVect1 += 16;
+    v2 = _mm512_loadu_ps(pVect2);
+    pVect2 += 16;
+    dot = _mm512_fmadd_ps(v1, v2, dot);
+    aMag = _mm512_fmadd_ps(v1, v1, aMag);
+    bMag = _mm512_fmadd_ps(v2, v2, bMag);
+  }
+
+  f32 dotSum = _mm512_reduce_add_ps(dot);
+  f32 aMagSum = _mm512_reduce_add_ps(aMag);
+  f32 bMagSum = _mm512_reduce_add_ps(bMag);
+  return 1 - (dotSum / (sqrt(aMagSum) * sqrt(bMagSum)));
+}
+
+#else  // Compilers without target-attribute multiversioning (real MSVC, not
+       // clang-cl): fall back to the original compile-time-flag-gated kernels.
+       // These require the whole TU to be built with a matching /arch:AVX2 or
+       // /arch:AVX512 flag, so enabling SQLITE_VEC_ENABLE_AVX/AVX512 here is
+       // still the caller's responsibility to match against the actual
+       // deployment target's CPU -- there's no way to check at runtime.
+
+#ifdef SQLITE_VEC_ENABLE_AVX
+#include <immintrin.h>
+#ifndef PORTABLE_ALIGN32
+#define PORTABLE_ALIGN32 __declspec(align(32))
+#endif
+
 static f32 cosine_float_avx(const void *pVect1v, const void *pVect2v,
                             const void *qty_ptr) {
   f32 *pVect1 = (f32 *)pVect1v;
@@ -180,11 +302,6 @@ static f32 cosine_float_avx(const void *pVect1v, const void *pVect2v,
 #ifdef SQLITE_VEC_ENABLE_AVX512
 #include <immintrin.h>
 
-// 32-wide, unrolled-by-2 AVX-512 version of cosine_float_avx: one __m512 register
-// holds 16 floats natively, so two iterations of the AVX2 kernel's 16-wide inner
-// step collapse into one 32-wide step here. Same three running sums (dot product,
-// both vectors' squared magnitudes); _mm512_reduce_add_ps replaces the manual
-// store-and-sum horizontal reduction AVX2 needs, since AVX-512 has it built in.
 static f32 cosine_float_avx512(const void *pVect1v, const void *pVect2v,
                                const void *qty_ptr) {
   f32 *pVect1 = (f32 *)pVect1v;
@@ -223,6 +340,8 @@ static f32 cosine_float_avx512(const void *pVect1v, const void *pVect2v,
   return 1 - (dotSum / (sqrt(aMagSum) * sqrt(bMagSum)));
 }
 #endif
+
+#endif  // defined(__GNUC__) || defined(__clang__)
 
 #ifdef SQLITE_VEC_ENABLE_NEON
 #include <arm_neon.h>
@@ -608,6 +727,22 @@ static f32 distance_cosine_float(const void *a, const void *b, const void *d) {
     return cosine_float_neon(a, b, d);
   }
 #endif
+#if defined(__GNUC__) || defined(__clang__)
+  // Runtime dispatch: one build picks the best ISA the running CPU actually
+  // has, instead of the caller having to know the deployment target's CPU at
+  // compile time. See the cosine_float_avx/avx512 definitions above.
+  {
+    size_t dims = *(const size_t *)d;
+    if (dims % 32 == 0 && __builtin_cpu_supports("avx512f") &&
+        __builtin_cpu_supports("fma")) {
+      return cosine_float_avx512(a, b, d);
+    }
+    if (dims % 16 == 0 && __builtin_cpu_supports("avx2") &&
+        __builtin_cpu_supports("fma")) {
+      return cosine_float_avx(a, b, d);
+    }
+  }
+#else
 #ifdef SQLITE_VEC_ENABLE_AVX512
   if (((*(const size_t *)d) % 32 == 0)) {
     return cosine_float_avx512(a, b, d);
@@ -617,6 +752,7 @@ static f32 distance_cosine_float(const void *a, const void *b, const void *d) {
   if (((*(const size_t *)d) % 16 == 0)) {
     return cosine_float_avx(a, b, d);
   }
+#endif
 #endif
   return cosine_float(a, b, d);
 }
